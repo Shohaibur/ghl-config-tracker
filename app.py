@@ -15,7 +15,8 @@ from dotenv import load_dotenv
 from collect import take_snapshot
 from diff import compare, list_snapshots, render_report
 from ghl.client import GHLClient, GHLError
-from ghl.collectors import MODELS, get_custom_fields, get_pipelines
+from ghl.collectors import (MODELS, field_value, get_companies, get_company_record, get_custom_fields,
+                            get_opportunities, get_pipelines)
 
 MODEL_LABELS = {"contact": "Contact", "opportunity": "Opportunity", "business": "Company (business)"}
 SETTINGS = ("GHL_TOKEN", "GHL_LOCATION_ID", "APP_USERNAME", "APP_PASSWORD")
@@ -187,13 +188,126 @@ def change_log_page():
     )
 
 
+# ---------- Records: Companies ----------
+COMPANY_FIELDS = [  # shown first, in this order; everything else goes under "All company fields"
+    ("dealer_id", "Dealer ID"), ("account_status", "Account status"),
+    ("active_acquisitions", "Active ACQ"), ("active_recall", "Active RCL"), ("active_bcp", "Active BCP"),
+    ("active_monthly_value", "Active monthly value"), ("rollup_last_updated", "Rollup last updated"),
+    ("dealer_group", "Dealer group"), ("contracting_entity", "Contracting entity"),
+]
+INVOICE_ICON = {"paid": "✅ Paid", "sent": "⏳ Sent", "partially paid": "🟡 Partially paid", "past due": "⚠️ Past due"}
+
+
+def show(v) -> str:
+    if isinstance(v, dict) and "value" in v:
+        v = v["value"]
+    if isinstance(v, list):
+        v = ", ".join(str(x) for x in v)
+    return "" if v is None else str(v)
+
+
+def load_records():
+    """Companies + all opportunities + the lookups needed to read them."""
+    fields = get_custom_fields(client, "opportunity")
+    pipes = get_pipelines(client)
+    return {
+        "companies": get_companies(client),
+        "opps": get_opportunities(client),
+        "field_keys": {f["id"]: (f.get("fieldKey") or "").removeprefix("opportunity.") for f in fields},
+        "pipeline_names": {p["id"]: p.get("name") for p in pipes},
+        "stage_names": {s["id"]: s.get("name") for p in pipes for s in (p.get("stages") or [])},
+    }
+
+
+def companies_page():
+    st.subheader("Companies")
+    st.caption("Live from GHL. Opportunities are matched to a company by Dealer ID.")
+
+    if st.button("Load latest from GHL", type="primary"):
+        load("records", load_records)
+        st.session_state["company_records"] = {}  # clear cached company details
+
+    data = st.session_state.get("records")
+    if data is None:
+        st.info("Click the button to load companies and opportunities.")
+        return
+    companies = data["companies"]
+    if not companies:
+        st.info("No companies found in this account.")
+        return
+    st.caption(f"{len(companies)} companies · {len(data['opps'])} opportunities · loaded at {st.session_state['records_at']}")
+
+    by_id = {c["id"]: c for c in companies}
+    company_id = st.selectbox("Company", list(by_id), format_func=lambda i: by_id[i].get("name") or i)
+
+    # Company details (one request per company, then kept for this session)
+    cache = st.session_state.setdefault("company_records", {})
+    if company_id not in cache:
+        try:
+            cache[company_id] = get_company_record(client, company_id)
+        except GHLError as e:
+            st.error(str(e))
+            return
+    props = cache[company_id].get("properties") or {}
+
+    st.markdown("#### Company details")
+    cols = st.columns(3)
+    for i, (key, label) in enumerate(COMPANY_FIELDS):
+        cols[i % 3].markdown(f"**{label}**  \n{show(props.get(key)) or '—'}")
+    others = {k: show(v) for k, v in props.items() if k not in dict(COMPANY_FIELDS)}
+    if others:
+        with st.expander(f"All company fields ({len(props)})"):
+            st.dataframe(pd.DataFrame(sorted(others.items()), columns=["Field", "Value"]), hide_index=True)
+
+    # Opportunities with the same Dealer ID
+    dealer = show(props.get("dealer_id")).strip()
+    st.markdown("#### Opportunities")
+    if not dealer:
+        st.info("This company has no Dealer ID, so its opportunities can't be matched.")
+        return
+    rows = []
+    for o in data["opps"]:
+        v = {data["field_keys"].get(cf.get("id")): field_value(cf) for cf in (o.get("customFields") or [])}
+        if show(v.get("dealer_id")).strip() != dealer:
+            continue
+        invoice = show(v.get("invoice_status"))
+        rows.append({
+            "Name": o.get("name"),
+            "Pipeline": data["pipeline_names"].get(o.get("pipelineId"), ""),
+            "Stage": data["stage_names"].get(o.get("pipelineStageId"), ""),
+            "Status": o.get("status"),
+            "Product": show(v.get("product")),
+            "Deal phase": show(v.get("deal_phase")),
+            "Invoice": INVOICE_ICON.get(invoice.lower(), invoice),
+            "Amount due": show(v.get("amount_due")),
+            "Invoice due": show(v.get("invoice_due_date")),
+            "Past due": "⚠️" if str(v.get("past_due_flag")).lower() in ("true", "yes", "['yes']") else "",
+        })
+    if not rows:
+        st.info(f"No opportunities have Dealer ID {dealer}.")
+        return
+
+    # Billing at a glance
+    invoices = [r["Invoice"] for r in rows if r["Invoice"]]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Opportunities", len(rows))
+    c2.metric("Invoices paid", sum(i.startswith("✅") for i in invoices))
+    c3.metric("Invoices unpaid", sum(not i.startswith("✅") for i in invoices))
+    c4.metric("Past due", sum(r["Invoice"].startswith("⚠️") or bool(r["Past due"]) for r in rows))
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, hide_index=True)
+    st.download_button("Download CSV", df.to_csv(index=False), file_name=f"opportunities_{dealer}.csv", mime="text/csv")
+
+
 # ---------- Sidebar menu ----------
 fields_pg = st.Page(custom_fields_page, title="Custom fields", icon=":material/list_alt:", url_path="fields", default=True)
 pipelines_pg = st.Page(pipelines_page, title="Pipelines", icon=":material/view_kanban:", url_path="pipelines")
+companies_pg = st.Page(companies_page, title="Companies", icon=":material/apartment:", url_path="companies")
 changes_pg = st.Page(change_log_page, title="Change log", icon=":material/history:", url_path="changes")
 
 # Streamlit's automatic menu always sits at the top, so we hide it and build our own
-current = st.navigation([fields_pg, pipelines_pg, changes_pg], position="hidden")
+current = st.navigation([fields_pg, pipelines_pg, companies_pg, changes_pg], position="hidden")
 
 with st.sidebar:
     # Show the end of the location ID so you can confirm it's the right account
@@ -204,6 +318,9 @@ with st.sidebar:
     if current.url_path == fields_pg.url_path:
         st.selectbox("Object", MODELS, format_func=MODEL_LABELS.get, key="model")
     st.page_link(pipelines_pg)
+
+    st.caption("RECORDS")
+    st.page_link(companies_pg)
 
     st.caption("MONITOR")
     st.page_link(changes_pg)
