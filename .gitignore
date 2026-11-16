@@ -3,6 +3,7 @@
 
 # GHL data stays off the public repo
 snapshots/
+reports/
 
 # Python
 .venv/
