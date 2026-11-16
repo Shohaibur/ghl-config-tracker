@@ -1,0 +1,10 @@
+# Secrets
+.env
+
+# GHL data stays off the public repo
+snapshots/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
